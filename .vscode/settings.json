@@ -5,5 +5,23 @@
     },
     "files.exclude": {
         ".gitignore": true
-    }
+    },
+    "cSpell.words": [
+        "brodcaster",
+        "cdylib",
+        "clogger",
+        "decompressinator",
+        "dylib",
+        "flate",
+        "injectinatoration",
+        "libloading",
+        "linux",
+        "Ljava",
+        "Lnet",
+        "Lorg",
+        "manepear",
+        "minecraft",
+        "repr",
+        "tokio"
+    ]
 }
