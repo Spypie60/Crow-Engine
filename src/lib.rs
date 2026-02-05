@@ -90,15 +90,31 @@ fn cleanup_crow() {
     }
 }
 #[allow(unused)]
+#[unsafe(no_mangle)]
 pub extern "system" fn jni_onload(jvm: JavaVM, _reserved: *mut std::os::raw::c_void) {
     let _ = JVM.set(jvm);
     jni::sys::JNI_VERSION_1_8;
 }
-
+#[allow(unused)]
+#[unsafe(no_mangle)]
+pub extern "C" fn crunning(_env: &mut JNIEnv)-> bool {
+    let client_class = _env.find_class("net/minecraft/client/MinecraftClient");
+    let instance = _env.get_static_field(client_class.unwrap(), "field_1726", "Lnet/minecraft/class_310;").unwrap().l().unwrap();
+    let is_running = _env.get_field(instance, "field_1745", "Z").unwrap().z().unwrap();
+    if is_running {
+        return false;
+    } else if !is_running {
+        return true;
+        cleanup_crow();
+    } else {
+        unsafe {clogger_err(_env, "[CROW ERROR] How do you fail on a bool? anyways jni unload error".to_string());}
+        return false;
+    }
+}
 #[allow(unused)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_env() -> JNIEnv<'static> {
-    JVM.get().expect("[CROW ERROR] JVM NOT ATTACHED").attach_current_thread().expect("[CROW ERROR] Could not attach");
+    JVM.get().expect("[CROW ERROR] JVM NOT ATTACHED").attach_current_thread().expect(panic!("[CROW ERROR] Could not attach"));
     let guard = JVM.get().unwrap().attach_current_thread().unwrap();
     unsafe { JNIEnv::from_raw(guard.get_native_interface()).unwrap()}
 
@@ -106,22 +122,22 @@ pub unsafe extern "C" fn get_env() -> JNIEnv<'static> {
 
 static TICK_LISTENERS: Mutex<Vec<unsafe extern "C" fn(f32)>> = Mutex::new(Vec::new());
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn get_minecraft_tps(env: &mut JNIEnv<'_>) -> Result<f32, jni::errors::Error> {
-    let client_class = env.find_class("net/minecraft/client/MinecraftClient")?;
-    let instance = env.get_static_field(client_class, "instance", "Lnet/minecraft/client/MinecraftClient;")?.l()?;
-    let server = env.get_field(instance, "server", "Lnet/minecraft/server/integrated/IntegratedServer;")?.l()?;
+pub unsafe extern "C" fn get_minecraft_tps(_env: &mut JNIEnv<'_>) -> Result<f32, jni::errors::Error> {
+    let client_class = _env.find_class("net/minecraft/client/MinecraftClient")?;
+    let instance = _env.get_static_field(client_class, "instance", "Lnet/minecraft/client/MinecraftClient;")?.l()?;
+    let server = _env.get_field(instance, "server", "Lnet/minecraft/server/integrated/IntegratedServer;")?.l()?;
     if server.is_null() {
         return Ok(20.0);
     }
-    let tick_time = env.call_method(server, "getTickTime", "()F", &[])?.f()?;
+    let tick_time = _env.call_method(server, "getTickTime", "()F", &[])?.f()?;
     if tick_time > 0.0 {
         Ok(1000.0 / tick_time)
     } else {
-        Ok(20.0)
+        Ok(20.0) //default
     }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clogger(_env: &mut JNIEnv<'_>, message: &str) {
+pub unsafe extern "C" fn clogger(_env: &mut JNIEnv<'_>, message: String) {
     if let Ok(log_manager) = _env.find_class("org/apache/logging/log4j/LogManager") {
         let engine_name = _env.new_string("CrowEngine").unwrap();
         if let Ok(logger_obj) = _env.call_static_method(
@@ -140,12 +156,52 @@ pub unsafe extern "C" fn clogger(_env: &mut JNIEnv<'_>, message: &str) {
         }
     }
 }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clogger_err(_env: &mut JNIEnv<'_>, message: String) {
+    if let Ok(log_manager) = _env.find_class("org/apache/logging/log4j/LogManager") {
+        let engine_name = _env.new_string("CrowEngine").unwrap();
+        if let Ok(logger_obj) = _env.call_static_method(
+            log_manager,
+            "getLogger",
+            "(Ljava/lang/String;)Lorg/apache/logging/log4j/Logger;",
+            &[JValue::Object(&engine_name)],
+        ).and_then(|v| v.l()) {
+            let j_msg = _env.new_string(message).unwrap();
+            let _ = _env.call_method(
+                logger_obj,
+                "error",
+                "(Ljava/lang/String;)V",
+                &[JValue::Object(&j_msg)],
+            );
+        }
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clogger_warn(_env: &mut JNIEnv<'_>, message: String) {
+    if let Ok(log_manager) = _env.find_class("org/apache/logging/log4j/LogManager") {
+        let engine_name = _env.new_string("CrowEngine").unwrap();
+        if let Ok(logger_obj) = _env.call_static_method(
+            log_manager,
+            "getLogger",
+            "(Ljava/lang/String;)Lorg/apache/logging/log4j/Logger;",
+            &[JValue::Object(&engine_name)],
+        ).and_then(|v| v.l()) {
+            let j_msg = _env.new_string(message).unwrap();
+            let _ = _env.call_method(
+                logger_obj,
+                "warn",
+                "(Ljava/lang/String;)V",
+                &[JValue::Object(&j_msg)],
+            );
+        }
+    }
+}
 #[allow(unused)]
 pub fn crow_broadcast_tick(mut _env: JNIEnv<'_>, _class: jni::objects::JClass){
     let tps = match unsafe { get_minecraft_tps(&mut _env) } {
         Ok(tps) => tps,
         Err(_e) => 20.0,
-        _ => {unsafe { clogger(&mut _env, "[CROW ERROR] Kinda a skill issue.(broadcast tick)") }; 20.0},
+        _ => {unsafe { clogger_err(&mut _env, "[CROW ERROR] Something ain't right.(broadcast tick)".to_string()) }; 20.0},
     };
     let dt = 1.0/tps;
     if let Ok(listeners) = TICK_LISTENERS.lock() {
@@ -165,7 +221,7 @@ async fn crow_manepear(_env: &mut JNIEnv<'_>)/*-> Vec<Library>*/ {
         }
     }
 
-    unsafe { clogger(_env,format!("[CROW] {} mods are now active in memory.", active_mods.len()).as_str()) };
+    unsafe { clogger(_env,format!("[CROW] {} mods are now active in memory.", active_mods.len())) };
    // return active_mods;
 }
 

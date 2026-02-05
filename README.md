@@ -1,5 +1,5 @@
-# Crow Engine
-Crow Engine is a high-performance, native modding SDK and loader for Minecraft 1.21+. Unlike traditional loaders that run inside the Java Virtual Machine (JVM), Crow leverages Rust to provide direct hardware access, SIMD-accelerated physics, and low-level rendering hooks.
+# 🐦‍⬛Crow Engine
+Crow Engine is a high-performance, with a native modding SDK and loader for Minecraft 26.1+. Unlike traditional loaders that run inside the Java Virtual Machine (JVM), Crow leverages Rust to provide direct hardware access, SIMD-accelerated physics, and low-level rendering hooks.
 
 # 🚀 Why Crow?
 Traditional modding hits a "Java Ceiling" where the Garbage Collector (GC) and JVM overhead limit what’s possible. Crow breaks this ceiling by moving heavy-duty logic to the native layer.
@@ -20,7 +20,8 @@ The "Handshake" Protocol: A stable JNI bridge that maps Minecraft’s obfuscated
 
 Signature Scanning: Survives minor game updates by auto-locating memory offsets for player data and rendering calls.
 
-# 📦 Getting Started
+## 📦 Getting Started
+## FUTURE WHEN CLI MADE
 Prerequisites
 Rust (Stable or Nightly)
 
