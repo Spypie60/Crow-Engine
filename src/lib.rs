@@ -1,12 +1,10 @@
-use jni::objects::JValue;
-#[allow(unused)]
-use jni::{JNIVersion, JavaVM, JNIEnv};
+use jni::{JavaVM, JNIEnv, objects::JValue};
 use libloading::Library;
 use std::{fs::{self}, io::{Read, Write}, sync::{Mutex, OnceLock}};
 use flate2::write::ZlibEncoder;
 use flate2::read::ZlibDecoder;
-use lazy_static::lazy_static;
 use flate2::Compression;
+use lazy_static::lazy_static;
 #[allow(unused)]
 async unsafe fn scan_n_load_m(path: &str) -> Vec<Library> {
     let mut loaded_libraries = Vec::new();
@@ -197,7 +195,7 @@ pub unsafe extern "C" fn clogger_warn(_env: &mut JNIEnv<'_>, message: String) { 
     }
 }
 #[allow(unused)]
-pub fn crow_broadcast_tick(mut _env: JNIEnv<'_>, _class: jni::objects::JClass){ //I feel like sdk should manage this
+pub fn crow_broadcast_tick(mut _env: JNIEnv<'_>, _class: jni::objects::JClass){ //I feel like api should manage this
     let tps = match unsafe { get_minecraft_tps(&mut _env) } {
         Ok(tps) => tps,
         Err(_e) => 20.0,
@@ -226,7 +224,7 @@ async fn crow_manepear(_env: &mut JNIEnv<'_>)/*-> Vec<Library>*/ {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn crow_version()-> String{
+pub unsafe extern "C" fn ccrow_version()-> String{ // core crow version
     std::env::var("ARGO_PKG_VERSION").unwrap_or("0.0.0".to_string()).to_string()
 }
 
