@@ -79,11 +79,11 @@ pub fn get_os_ext() -> &'static str {
 }
 
 lazy_static! {
-    static ref LOADED_MODS: Mutex<Vec<Library>> = Mutex::new(Vec::new());
+    static ref LOADED_MODS: Mutex<Vec<Library>> = Mutex::new(Vec::new()); //well it stores loaded mods
 }
-static JVM: OnceLock<JavaVM> = OnceLock::new();
+static JVM: OnceLock<JavaVM> = OnceLock::new(); //I don't even know what this does "hey chatgpt what does this do?"
 #[allow(unused)]
-fn cleanup_crow() {
+fn cleanup_crow() { //I shouldn't have to write this comment
     println!("[CROW] Closing...");
     if let Ok(mut mods) = LOADED_MODS.lock() {
         mods.clear();
@@ -91,13 +91,13 @@ fn cleanup_crow() {
 }
 #[allow(unused)]
 #[unsafe(no_mangle)]
-pub extern "system" fn jni_onload(jvm: JavaVM, _reserved: *mut std::os::raw::c_void) {
+pub extern "system" fn jni_onload(jvm: JavaVM, _reserved: *mut std::os::raw::c_void) { //on load
     let _ = JVM.set(jvm);
     jni::sys::JNI_VERSION_1_8;
 }
 #[allow(unused)]
 #[unsafe(no_mangle)]
-pub extern "C" fn crunning(_env: &mut JNIEnv)-> bool {
+pub extern "C" fn crunning(_env: &mut JNIEnv)-> bool { //crow running check
     let client_class = _env.find_class("net/minecraft/client/MinecraftClient");
     let instance = _env.get_static_field(client_class.unwrap(), "field_1726", "Lnet/minecraft/class_310;").unwrap().l().unwrap();
     let is_running = _env.get_field(instance, "field_1745", "Z").unwrap().z().unwrap();
@@ -113,7 +113,7 @@ pub extern "C" fn crunning(_env: &mut JNIEnv)-> bool {
 }
 #[allow(unused)]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn get_env() -> JNIEnv<'static> {
+pub unsafe extern "C" fn get_env() -> JNIEnv<'static> { //get_env gets env. good luck troubleshooting this
     JVM.get().expect("[CROW ERROR] JVM NOT ATTACHED").attach_current_thread().expect(panic!("[CROW ERROR] Could not attach"));
     let guard = JVM.get().unwrap().attach_current_thread().unwrap();
     unsafe { JNIEnv::from_raw(guard.get_native_interface()).unwrap()}
@@ -122,7 +122,7 @@ pub unsafe extern "C" fn get_env() -> JNIEnv<'static> {
 
 static TICK_LISTENERS: Mutex<Vec<unsafe extern "C" fn(f32)>> = Mutex::new(Vec::new());
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn get_minecraft_tps(_env: &mut JNIEnv<'_>) -> Result<f32, jni::errors::Error> {
+pub unsafe extern "C" fn get_minecraft_tps(_env: &mut JNIEnv<'_>) -> Result<f32, jni::errors::Error> { //its in the name come on
     let client_class = _env.find_class("net/minecraft/client/MinecraftClient")?;
     let instance = _env.get_static_field(client_class, "instance", "Lnet/minecraft/client/MinecraftClient;")?.l()?;
     let server = _env.get_field(instance, "server", "Lnet/minecraft/server/integrated/IntegratedServer;")?.l()?;
@@ -137,7 +137,7 @@ pub unsafe extern "C" fn get_minecraft_tps(_env: &mut JNIEnv<'_>) -> Result<f32,
     }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clogger(_env: &mut JNIEnv<'_>, message: String) {
+pub unsafe extern "C" fn clogger(_env: &mut JNIEnv<'_>, message: String) { //crow logger
     if let Ok(log_manager) = _env.find_class("org/apache/logging/log4j/LogManager") {
         let engine_name = _env.new_string("CrowEngine").unwrap();
         if let Ok(logger_obj) = _env.call_static_method(
@@ -157,7 +157,7 @@ pub unsafe extern "C" fn clogger(_env: &mut JNIEnv<'_>, message: String) {
     }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clogger_err(_env: &mut JNIEnv<'_>, message: String) {
+pub unsafe extern "C" fn clogger_err(_env: &mut JNIEnv<'_>, message: String) { //crow error logger
     if let Ok(log_manager) = _env.find_class("org/apache/logging/log4j/LogManager") {
         let engine_name = _env.new_string("CrowEngine").unwrap();
         if let Ok(logger_obj) = _env.call_static_method(
@@ -177,7 +177,7 @@ pub unsafe extern "C" fn clogger_err(_env: &mut JNIEnv<'_>, message: String) {
     }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clogger_warn(_env: &mut JNIEnv<'_>, message: String) {
+pub unsafe extern "C" fn clogger_warn(_env: &mut JNIEnv<'_>, message: String) { //self explanatory
     if let Ok(log_manager) = _env.find_class("org/apache/logging/log4j/LogManager") {
         let engine_name = _env.new_string("CrowEngine").unwrap();
         if let Ok(logger_obj) = _env.call_static_method(
@@ -197,7 +197,7 @@ pub unsafe extern "C" fn clogger_warn(_env: &mut JNIEnv<'_>, message: String) {
     }
 }
 #[allow(unused)]
-pub fn crow_broadcast_tick(mut _env: JNIEnv<'_>, _class: jni::objects::JClass){
+pub fn crow_broadcast_tick(mut _env: JNIEnv<'_>, _class: jni::objects::JClass){ //I feel like sdk should manage this
     let tps = match unsafe { get_minecraft_tps(&mut _env) } {
         Ok(tps) => tps,
         Err(_e) => 20.0,
@@ -212,7 +212,7 @@ pub fn crow_broadcast_tick(mut _env: JNIEnv<'_>, _class: jni::objects::JClass){
         }
     }
 
-}
+} //yes and no a reference
 async fn crow_manepear(_env: &mut JNIEnv<'_>)/*-> Vec<Library>*/ {
     let active_mods = unsafe { scan_n_load_m("./mods").await };
     for lib in active_mods.iter() {
@@ -223,6 +223,11 @@ async fn crow_manepear(_env: &mut JNIEnv<'_>)/*-> Vec<Library>*/ {
 
     unsafe { clogger(_env,format!("[CROW] {} mods are now active in memory.", active_mods.len())) };
    // return active_mods;
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn crow_version()-> String{
+    std::env::var("ARGO_PKG_VERSION").unwrap_or("0.0.0".to_string()).to_string()
 }
 
 #[allow(unused)]
