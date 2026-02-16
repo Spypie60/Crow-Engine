@@ -101,7 +101,7 @@ fn cleanup_crow() { //I shouldn't have to write this comment
 
 #[allow(unused)]
 #[unsafe(no_mangle)]
-pub extern "system" fn jni_onload(jvm: JavaVM, _reserved: *mut std::os::raw::c_void) { //on load
+pub extern "system" fn JNI_OnLoad(jvm: JavaVM, _reserved: *mut std::os::raw::c_void) { //on load
     let _ = JVM.set(jvm);
     unsafe { clogger(&mut get_env(), "message".to_string()) };
     crow_main();
