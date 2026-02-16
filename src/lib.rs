@@ -1,4 +1,4 @@
-use jni::{JavaVM, JNIEnv, objects::JValue};
+use jni::{JNIEnv, JavaVM, objects::JValue};
 use libloading::Library;
 use std::{fs::{self}, io::{Read, Write}, sync::{Mutex, OnceLock}};
 use flate2::write::ZlibEncoder;
@@ -43,10 +43,20 @@ async unsafe fn scan_n_load_m(path: &str) -> Vec<Library> {
     }
     loaded_libraries
 }
+pub struct Masoin { //what mod init provides pronounced "maze-ahhn" goofy tone
+    pub env: JNIEnv<'static>,
+    pub mod_id: String,
+    pub engine: Library,
+    pub name: String,
+    pub crow_id: String,
+    pub crow_version: String,
+}
 #[allow(unused,forgetting_references)]
 //injectinatoration 3000
 #[unsafe(no_mangle)]
+#[allow(improper_ctypes_definitions)]
 pub unsafe extern "C" fn init_mod(lib: &Library){
+    type Initifn = unsafe extern "C" fn(Masoin)-> std::io::Result<()>;
     let _init_lib: libloading::Symbol<fn()> = unsafe { lib.get("crow_init").unwrap() };
     _init_lib();
     std::mem::forget(lib);
@@ -87,18 +97,22 @@ fn cleanup_crow() { //I shouldn't have to write this comment
         mods.clear();
     }
 }
+
+
 #[allow(unused)]
 #[unsafe(no_mangle)]
 pub extern "system" fn jni_onload(jvm: JavaVM, _reserved: *mut std::os::raw::c_void) { //on load
     let _ = JVM.set(jvm);
+    unsafe { clogger(&mut get_env(), "message".to_string()) };
+    crow_main();
     jni::sys::JNI_VERSION_1_8;
 }
 #[allow(unused)]
 #[unsafe(no_mangle)]
-pub extern "C" fn crunning(_env: &mut JNIEnv)-> bool { //crow running check
-    let client_class = _env.find_class("net/minecraft/client/MinecraftClient");
-    let instance = _env.get_static_field(client_class.unwrap(), "field_1726", "Lnet/minecraft/class_310;").unwrap().l().unwrap();
-    let is_running = _env.get_field(instance, "field_1745", "Z").unwrap().z().unwrap();
+pub unsafe extern "C" fn crunning(_env: &mut JNIEnv)-> bool { //crow running check
+let client_class = _env.find_class("net/minecraft/client/Minecraft").expect("Failed to find Minecraft class");
+let instance = _env.get_static_field(client_class,"instance","Lnet/minecraft/client/Minecraft;").expect("Failed to get Minecraft instance").l().expect("Instance is null");
+let is_running = _env.get_field(instance,"running","Z").expect("Failed to get running field").z().expect("Failed to read boolean");
     if is_running {
         return false;
     } else if !is_running {
@@ -120,6 +134,7 @@ pub unsafe extern "C" fn get_env() -> JNIEnv<'static> { //get_env gets env. good
 
 static TICK_LISTENERS: Mutex<Vec<unsafe extern "C" fn(f32)>> = Mutex::new(Vec::new());
 #[unsafe(no_mangle)]
+#[allow(improper_ctypes_definitions)]
 pub unsafe extern "C" fn get_minecraft_tps(_env: &mut JNIEnv<'_>) -> Result<f32, jni::errors::Error> { //its in the name come on
     let client_class = _env.find_class("net/minecraft/client/MinecraftClient")?;
     let instance = _env.get_static_field(client_class, "instance", "Lnet/minecraft/client/MinecraftClient;")?.l()?;
@@ -135,6 +150,7 @@ pub unsafe extern "C" fn get_minecraft_tps(_env: &mut JNIEnv<'_>) -> Result<f32,
     }
 }
 #[unsafe(no_mangle)]
+#[allow(improper_ctypes_definitions)]
 pub unsafe extern "C" fn clogger(_env: &mut JNIEnv<'_>, message: String) { //crow logger
     if let Ok(log_manager) = _env.find_class("org/apache/logging/log4j/LogManager") {
         let engine_name = _env.new_string("CrowEngine").unwrap();
@@ -155,6 +171,7 @@ pub unsafe extern "C" fn clogger(_env: &mut JNIEnv<'_>, message: String) { //cro
     }
 }
 #[unsafe(no_mangle)]
+#[allow(improper_ctypes_definitions)]
 pub unsafe extern "C" fn clogger_err(_env: &mut JNIEnv<'_>, message: String) { //crow error logger
     if let Ok(log_manager) = _env.find_class("org/apache/logging/log4j/LogManager") {
         let engine_name = _env.new_string("CrowEngine").unwrap();
@@ -175,6 +192,7 @@ pub unsafe extern "C" fn clogger_err(_env: &mut JNIEnv<'_>, message: String) { /
     }
 }
 #[unsafe(no_mangle)]
+#[allow(improper_ctypes_definitions)]
 pub unsafe extern "C" fn clogger_warn(_env: &mut JNIEnv<'_>, message: String) { //self explanatory
     if let Ok(log_manager) = _env.find_class("org/apache/logging/log4j/LogManager") {
         let engine_name = _env.new_string("CrowEngine").unwrap();
@@ -195,6 +213,7 @@ pub unsafe extern "C" fn clogger_warn(_env: &mut JNIEnv<'_>, message: String) { 
     }
 }
 #[allow(unused)]
+#[allow(improper_ctypes_definitions)]
 pub fn crow_broadcast_tick(mut _env: JNIEnv<'_>, _class: jni::objects::JClass){ //I feel like api should manage this
     let tps = match unsafe { get_minecraft_tps(&mut _env) } {
         Ok(tps) => tps,
@@ -211,7 +230,7 @@ pub fn crow_broadcast_tick(mut _env: JNIEnv<'_>, _class: jni::objects::JClass){ 
     }
 
 } //yes and no a reference
-async fn crow_manepear(_env: &mut JNIEnv<'_>)/*-> Vec<Library>*/ {
+pub async fn crow_manepear(_env: &mut JNIEnv<'_>)/*-> Vec<Library>*/ {
     let active_mods = unsafe { scan_n_load_m("./mods").await };
     for lib in active_mods.iter() {
         unsafe {
@@ -224,13 +243,60 @@ async fn crow_manepear(_env: &mut JNIEnv<'_>)/*-> Vec<Library>*/ {
 }
 
 #[unsafe(no_mangle)]
+#[allow(improper_ctypes_definitions)]
 pub unsafe extern "C" fn ccrow_version()-> String{ // core crow version
     std::env::var("ARGO_PKG_VERSION").unwrap_or("0.0.0".to_string()).to_string()
+}
+pub fn test_make_item(env: &mut JNIEnv) {
+    // 1. Create Item.Properties
+    // Java: new Item.Properties()
+    let props_class = env.find_class("net/minecraft/world/item/Item$Properties").unwrap();
+    let props_obj = env.new_object(props_class, "()V", &[]).unwrap();
+
+    // 2. Create the Item instance
+    // Java: new Item(props)
+    let item_class = env.find_class("net/minecraft/world/item/Item").unwrap();
+    let item_instance = env.new_object(
+        item_class, 
+        "(Lnet/minecraft/world/item/Item$Properties;)V", 
+        &[(&props_obj).into()]
+    ).unwrap();
+
+    // 3. Create the ID (ResourceLocation)
+    // Java: ResourceLocation.parse("crow:test_ruby")
+    let rl_class = env.find_class("net/minecraft/resources/ResourceLocation").unwrap();
+    let id_str = env.new_string("crow:test_ruby").unwrap();
+    let resource_location = env.call_static_method(
+        rl_class, 
+        "parse", 
+        "(Ljava/lang/String;)Lnet/minecraft/resources/ResourceLocation;", 
+        &[(&id_str).into()]
+    ).unwrap().l().unwrap();
+
+    // 4. Register it to the Built-In Registry
+    // Java: Registry.register(BuiltInRegistries.ITEM, id, item)
+    let registries_class = env.find_class("net/minecraft/core/registries/BuiltInRegistries").unwrap();
+    let item_registry = env.get_static_field(
+        registries_class, 
+        "ITEM", 
+        "Lnet/minecraft/core/DefaultedRegistry;"
+    ).unwrap().l().unwrap();
+
+    let registry_class = env.find_class("net/minecraft/core/Registry").unwrap();
+    env.call_static_method(
+        registry_class, 
+        "register", 
+        "(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/ResourceLocation;Ljava/lang/Object;)Ljava/lang/Object;", 
+        &[(&item_registry).into(), (&resource_location).into(), (&item_instance).into()]
+    ).expect("CRITICAL: Failed to register item!");
+
+    println!("[Crow] Test Ruby successfully injected into Minecraft!");
 }
 
 #[allow(unused)]
 #[unsafe(no_mangle)]
 pub extern "system" fn crow_main() {
     let mut env = unsafe { get_env() };
-    crow_manepear(&mut env);
+    //crow_manepear(&mut env);
+    test_make_item(&mut env);
 }
