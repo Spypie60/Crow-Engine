@@ -43,5 +43,5 @@ Crow Engine is licensed under the GNU GPL v3. We believe in keeping the "Native 
 
  - [ ] CLI Works?
  - [ ] SDK V1?
- - [ ] Java Injector?
+ - [X] Java Injector?
  - [X] Lazy?
