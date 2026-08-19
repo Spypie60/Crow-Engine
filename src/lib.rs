@@ -1,243 +1,413 @@
-use jni::{JNIEnv, JavaVM, objects::{JString, JValue}, sys::jint};
+use anyhow::{anyhow, Context, Result};
+use jni::{
+    jni_str,
+    objects::JValue,
+    signature::{FieldSignature, RuntimeMethodSignature},
+    sys::jint,
+    vm::ScopeToken,
+    Env, JavaVM,
+};
 use libloading::Library;
-use std::{fs::{self}, io::{Read,Write}, ptr, sync::{Mutex, OnceLock}, thread::{self, sleep}, time::Duration};
-use flate2::write::ZlibEncoder;
-use flate2::read::ZlibDecoder;
-use flate2::Compression;
-use lazy_static::lazy_static;
-use winapi::{ um::winuser::{MB_OK, MessageBoxA}};
+use std::{
+    ffi::{c_char, c_void, CStr, CString},
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, OnceLock,
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
-#[allow(unused)]
-#[tokio::main]
-async unsafe fn scan_n_load_m(path: &str) -> Vec<Library> {
-    let mut loaded_libraries = Vec::new();
-    let paths = fs::read_dir(path).expect("[CROW ERROR] Could not read mods directory");
+fn get_os_ext() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "dll"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "so"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "dylib"
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        "so"
+    }
+}
 
-    // 1. Prepare the temp cache directory
-    let temp_cache = std::env::temp_dir().join("crow_cache");
-    let _ = fs::remove_dir_all(&temp_cache); // Clean old session
-    fs::create_dir_all(&temp_cache).unwrap();
+pub enum WasNat {
+    Wasm(wasmtime::Module),
+    Native(Library),
+}
 
-    for entry in paths {
-        if let Ok(entry) = entry {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("crow") {
-                println!("[CROW] Extracting and loading: {:?}", path);
+static LOADED_MODS: Mutex<Vec<WasNat>> = Mutex::new(Vec::new());
+static TICK_LISTENERS: Mutex<Vec<unsafe extern "C" fn(f32)>> = Mutex::new(Vec::new());
+static MOD_NAME: Mutex<Option<String>> = Mutex::new(None);
+static JVM: OnceLock<JavaVM> = OnceLock::new();
+static WASM_ENGINE: OnceLock<wasmtime::Engine> = OnceLock::new();
+static STARTED: AtomicBool = AtomicBool::new(false);
+static TEMP_CACHE: OnceLock<PathBuf> = OnceLock::new();
 
-                // 2. Load and decompress the .crow file
-                // (Using your existing decompressor logic)
-                let compressed_data = fs::read(&path).unwrap();
-                let decompressed_content = decompressor(compressed_data).await;
+const CROW_VERSION: &CStr = unsafe {
+    CStr::from_bytes_with_nul_unchecked(concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes())
+};
 
-                // 3. Write to OS-specific temp file
-                let dll_name = format!("{}.{}", path.file_stem().unwrap().to_str().unwrap(), get_os_ext());
-                let dll_path = temp_cache.join(dll_name);
-                fs::write(&dll_path, decompressed_content).unwrap();
+/// ABI passed to `crow_init` in each native mod.
+/// `env` is only valid for the duration of that call — do not store it.
+#[repr(C)]
+pub struct Main {
+    pub env: *mut Env<'static>,
+    pub crow_version: *const c_char,
+}
 
-                // 4. Load into memory
-                match unsafe { Library::new(&dll_path) } {
-                    Ok(lib) => {
-                        loaded_libraries.push(lib);
-                    }
-                    Err(e) => println!("[CROW ERROR] Failed to load {:?}: {}", path, e),
-                }
+fn temp_cache() -> &'static Path {
+    TEMP_CACHE.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("crow_cache_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        dir
+    })
+}
+
+fn wasm_engine() -> &'static wasmtime::Engine {
+    WASM_ENGINE.get_or_init(wasmtime::Engine::default)
+}
+
+fn decompressor(raw: &[u8]) -> Result<Vec<u8>> {
+    fn decode(mut decoder: impl Read) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        decoder.read_to_end(&mut out)?;
+        Ok(out)
+    }
+    if raw.starts_with(&[0x1f, 0x8b]) {
+        return decode(flate2::read::GzDecoder::new(raw));
+    }
+
+    match decode(flate2::read::ZlibDecoder::new(raw)) {
+        Ok(out) if !out.is_empty() || raw.is_empty() => Ok(out),
+        _ => decode(flate2::read::DeflateDecoder::new(raw)),
+    }
+}
+
+fn jni_err(err: impl std::fmt::Debug) -> anyhow::Error {
+    anyhow!("{err:?}")
+}
+
+/// Attach this thread to the JVM and run `f`. The `Env` must not outlive `f`.
+pub fn with_env<F, R>(f: F) -> Result<R>
+where
+    F: FnOnce(&mut Env<'_>) -> Result<R>,
+{
+    let jvm = JVM.get().context("[Crow Engine] JVM GLOBAL NOT FOUND")?;
+    let mut scope = ScopeToken::default();
+    let mut attachment = unsafe {
+        jvm.get_env_attachment(&mut scope)
+            .map_err(jni_err)
+            .context("[Crow Engine] Bad day for getting Env")?
+    };
+    let env = attachment.borrow_env_mut();
+    f(env)
+}
+
+fn load_wasms(dir: &Path, loaded: &mut Vec<WasNat>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("wasm") {
+            continue;
+        }
+        match fs::read(&path).and_then(|bytes| {
+            wasmtime::Module::new(wasm_engine(), &bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        }) {
+            Ok(module) => {
+                println!("[CROW] Loaded wasm module: {:?}", path);
+                loaded.push(WasNat::Wasm(module));
             }
+            Err(e) => println!("[CROW ERROR] Failed to load wasm {:?}: {e}", path),
         }
     }
-    loaded_libraries
-}
-#[repr(C)]
-pub struct Main { //what mod init provides pronounced "maze-ahhn" goofy tone
-    pub env: JNIEnv<'static>,
-    pub mod_id: String,
-    pub name: String,
-    pub crow_id: String,
-    pub crow_version: String,
-}
-#[allow(unused,forgetting_references)]
-//injectinatoration 3000
-#[unsafe(no_mangle)]
-#[allow(improper_ctypes_definitions)]
-pub unsafe extern "C" fn init_mod(lib: &Library){
-    type Initifn = unsafe extern "C" fn(Masoin)-> std::io::Result<()>;
-    let _init_lib: libloading::Symbol<fn()> = unsafe { lib.get("crow_init").unwrap() };
-    _init_lib();
-    std::mem::forget(lib);
 }
 
+fn load_natives(dir: &Path, loaded: &mut Vec<WasNat>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        println!("[CROW ERROR] Could not read mods directory: {:?}", dir);
+        return;
+    };
 
+    let cache = temp_cache();
 
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("crow") {
+            continue;
+        }
+        println!("[CROW] Extracting and loading: {:?}", path);
 
-lazy_static! {
-    static ref LOADED_MODS: Mutex<Vec<Library>> = Mutex::new(Vec::new()); //well it stores loaded mods
+        let compressed = match fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                println!("[CROW ERROR] Failed to read {:?}: {e}", path);
+                continue;
+            }
+        };
+        let decompressed = match decompressor(&compressed) {
+            Ok(b) => b,
+            Err(e) => {
+                println!("[CROW ERROR] Failed to decompress {:?}: {e}", path);
+                continue;
+            }
+        };
+
+        if decompressed.starts_with(b"\0asm") {
+            match wasmtime::Module::new(wasm_engine(), &decompressed) {
+                Ok(module) => {
+                    println!("[CROW] Loaded wasm from .crow: {:?}", path);
+                    loaded.push(WasNat::Wasm(module));
+                }
+                Err(e) => println!("[CROW ERROR] Invalid wasm in {:?}: {e}", path),
+            }
+            continue;
+        }
+
+        let dll_name = format!(
+            "{}.{}",
+            path.file_stem().and_then(|s| s.to_str()).unwrap_or("mod"),
+            get_os_ext()
+        );
+        let dll_path = cache.join(dll_name);
+        if let Err(e) = fs::write(&dll_path, &decompressed) {
+            println!("[CROW ERROR] Failed to write {:?}: {e}", dll_path);
+            continue;
+        }
+
+        match unsafe { Library::new(&dll_path) } {
+            Ok(lib) => loaded.push(WasNat::Native(lib)),
+            Err(e) => println!("[CROW ERROR] Failed to load {:?}: {e}", path),
+        }
+    }
 }
-static JVM: OnceLock<JavaVM> = OnceLock::new(); //I don't even know what this does "hey chatgpt what does this do?"
-#[allow(unused)]
-fn cleanup_crow() { //I shouldn't have to write this comment
+
+unsafe fn init_mod(lib: &Library, env: &mut Env<'_>) {
+    let symbol = match unsafe { lib.get::<unsafe extern "C" fn(*mut Main) -> i32>(b"crow_init\0") }
+    {
+        Ok(s) => s,
+        Err(e) => {
+            println!("[CROW ERROR] Missing crow_init: {e}");
+            return;
+        }
+    };
+
+    let mut main = Main {
+        env: env as *mut Env<'_> as *mut Env<'static>,
+        crow_version: CROW_VERSION.as_ptr(),
+    };
+    let rc = unsafe { symbol(&mut main) };
+    if rc != 0 {
+        println!("[CROW ERROR] crow_init returned {rc}");
+    }
+}
+
+fn cleanup_crow() {
     println!("[CROW] Closing...");
     if let Ok(mut mods) = LOADED_MODS.lock() {
         mods.clear();
     }
-}
-#[unsafe(no_mangle)]
-pub extern "system" fn DllMain(_: *mut (), reason: u32, _: *mut ()) -> i32 {
-    if reason == 1 { // DLL_PROCESS_ATTACH
-        // Immediately spawn a thread to escape the Loader Lock
-        thread::spawn(|| {
-            unsafe {
-                MessageBoxA(
-                    ptr::null_mut(), 
-                    "Crow Engine: Escaped Loader Lock!\0".as_ptr() as *const i8, 
-                    "Crow\0".as_ptr() as *const i8, 
-                    MB_OK
-                );
-            }
-            
-        });
-        return 1;
-    } else if reason == 0 { // DLL_PROCESS_DETACH {
-        cleanup_crow();
-        return 1;
+    if let Ok(mut listeners) = TICK_LISTENERS.lock() {
+        listeners.clear();
     }
-    1
+    if let Some(cache) = TEMP_CACHE.get() {
+        let _ = fs::remove_dir_all(cache);
+    }
 }
+
+#[cfg(windows)]
 #[unsafe(no_mangle)]
-pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut std::ffi::c_void) -> jint {
+pub extern "system" fn DllMain(_: *mut c_void, reason: u32, _: *mut c_void) -> i32 {
+    match reason {
+        1 => {
+            // DLL_PROCESS_ATTACH — do not do heavy work here
+            crow_main();
+            1
+        }
+        0 => {
+            // DLL_PROCESS_DETACH
+            cleanup_crow();
+            1
+        }
+        _ => 1,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut c_void) -> jint {
     let _ = JVM.set(vm);
     crow_main();
-    return jni::sys::JNI_VERSION_1_8;
+    jni::sys::JNI_VERSION_1_8
 }
 
-#[allow(unused)]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn crunning(_env: &mut JNIEnv)-> bool { //crow running check
-let client_class = _env.find_class("net/minecraft/client/Minecraft").expect("Failed to find Minecraft class");
-let instance = _env.get_static_field(client_class,"instance","Lnet/minecraft/client/Minecraft;").expect("Failed to get Minecraft instance").l().expect("Instance is null");
-let is_running = _env.get_field(instance,"running","Z").expect("Failed to get running field").z().expect("Failed to read boolean");
-    if is_running {
+pub extern "system" fn JNI_OnUnload(_vm: JavaVM, _reserved: *mut c_void) {
+    cleanup_crow();
+}
+
+/// `true` when the Minecraft client is running.
+pub fn crunning(env: &mut Env<'_>) -> bool {
+    let Ok(client_class) = env.find_class(jni_str!("net/minecraft/client/Minecraft")) else {
         return false;
-    } else if !is_running {
-        return true;
-        cleanup_crow();
-    } else {
-        unsafe {clogger_err(_env, "[CROW ERROR] How do you fail on a bool? anyways jni unload error".to_string());}
-        return false;
+    };
+    let sig = unsafe {
+        FieldSignature::from_raw_parts(
+            jni_str!("Lnet/minecraft/client/Minecraft;"),
+            jni::signature::JavaType::Object,
+        )
+    };
+    let instance = match env
+        .get_static_field(client_class, jni_str!("instance"), sig)
+        .and_then(|v| v.l())
+    {
+        Ok(obj) => obj,
+        Err(_) => return false,
+    };
+    let sig = unsafe {
+        FieldSignature::from_raw_parts(
+            jni_str!("Z"),
+            jni::signature::JavaType::Primitive(jni::signature::Primitive::Boolean),
+        )
+    };
+    env.get_field(instance, jni_str!("running"), sig)
+        .and_then(|v| v.z())
+        .unwrap_or(false)
+}
+
+#[derive(Clone, Copy)]
+enum LogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+fn log_java(env: &mut Env<'_>, level: LogLevel, message: impl ToString) {
+    let Ok(log_manager) = env.find_class(jni_str!("org/apache/logging/log4j/LogManager")) else {
+        eprintln!("[CROW] {}", message.to_string());
+        return;
+    };
+    let get_logger =
+        RuntimeMethodSignature::from_str("(Ljava/lang/String;)Lorg/apache/logging/log4j/Logger;")
+            .unwrap();
+    let sig = get_logger.method_signature();
+    let engine_name = match env.new_string("CrowEngine") {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let Ok(logger_obj) = env
+        .call_static_method(
+            log_manager,
+            jni_str!("getLogger"),
+            get_logger.method_signature(),
+            &[JValue::Object(&engine_name)],
+        )
+        .and_then(|v| v.l())
+    else {
+        return;
+    };
+    let method = match level {
+        LogLevel::Info => jni_str!("info"),
+        LogLevel::Warn => jni_str!("warn"),
+        LogLevel::Error => jni_str!("error"),
+    };
+    let sig = RuntimeMethodSignature::from_str("(Ljava/lang/String;)V").unwrap();
+    let sig = sig.method_signature();
+    if let Ok(j_msg) = env.new_string(message.to_string()) {
+        let _ = env.call_method(logger_obj, method, sig, &[JValue::Object(&j_msg)]);
     }
 }
-#[allow(non_snake_case)]
-pub unsafe fn get_env() -> Option<JNIEnv<'static>> {
-    // 1. Get the JVM global
-    let jvm = match JVM.get() {
-        Some(v) => v,
-        None => {
-            println!("JVM GLOBAL NOT FOUND");
-            return None; 
-        }
+
+pub fn clogger(env: &mut Env<'_>, message: impl ToString) {
+    log_java(env, LogLevel::Info, message);
+}
+
+pub fn clogger_warn(env: &mut Env<'_>, message: impl ToString) {
+    log_java(env, LogLevel::Warn, message);
+}
+
+pub fn clogger_err(env: &mut Env<'_>, message: impl ToString) {
+    log_java(env, LogLevel::Error, message);
+}
+
+/// Stores a brand name for mods to read. Replacing `getServerModName()` needs a Java mixin.
+pub fn mod_name(_env: &mut Env<'_>, name: impl ToString) {
+    if let Ok(mut slot) = MOD_NAME.lock() {
+        *slot = Some(name.to_string());
+    }
+}
+
+pub fn get_tps(env: &mut Env<'_>) -> Result<f32> {
+    let client_class = env
+        .find_class(jni_str!("net/minecraft/client/Minecraft"))
+        .map_err(jni_err)?;
+    let sig = unsafe {
+        FieldSignature::from_raw_parts(
+            jni_str!("Lnet/minecraft/client/Minecraft;"),
+            jni::signature::JavaType::Object,
+        )
+    };
+    let instance = env
+        .get_static_field(client_class, jni_str!("instance"), sig)
+        .and_then(|v| v.l())
+        .map_err(jni_err)?;
+
+    let sig = RuntimeMethodSignature::from_str("()Lnet/minecraft/server/MinecraftServer;").unwrap();
+    let sig = sig.method_signature();
+    let server = match env
+        .call_method(instance, jni_str!("getSingleplayerServer"), sig, &[])
+        .and_then(|v| v.l())
+    {
+        Ok(s) if !s.is_null() => s,
+        _ => return Ok(20.0),
     };
 
-    // 2. Attach the current thread as a daemon
-    match jvm.attach_current_thread_as_daemon() {
-        Ok(guard) => {
-            let raw_ptr = guard.get_native_interface();
-            println!("Found Thread Finishing");
-            unsafe { Some(JNIEnv::from_raw(raw_ptr).ok()?) }
-
-        },
-        Err(_) => {
-            println!("NO THREAD");
-            None
-        }
-    }
-}
-
-static TICK_LISTENERS: Mutex<Vec<unsafe extern "C" fn(f32)>> = Mutex::new(Vec::new());
-#[unsafe(no_mangle)]
-#[allow(improper_ctypes_definitions)]
-pub unsafe extern "C" fn get_minecraft_tps(_env: &mut JNIEnv<'_>) -> Result<f32, jni::errors::Error> { //its in the name come on
-    crow_api::binding::net::minecraft::server::players
-    let client_class = _env.find_class("net/minecraft/client/MinecraftClient")?;
-    let instance = _env.get_static_field(client_class, "instance", "Lnet/minecraft/client/MinecraftClient;")?.l()?;
-    let server = _env.get_field(instance, "server", "Lnet/minecraft/server/integrated/IntegratedServer;")?.l()?;
-    if server.is_null() {
-        return Ok(20.0);
-    }
-    let tick_time = _env.call_method(server, "getTickTime", "()F", &[])?.f()?;
-    if tick_time > 0.0 {
-        Ok(1000.0 / tick_time)
-    } else {
-        Ok(20.0) //default
-    }
-}
-
-#[allow(improper_ctypes_definitions)]
-pub unsafe extern "C" fn clogger(_env: &mut JNIEnv<'_>, message: impl ToString) { //crow logger
-    if let Ok(log_manager) = _env.find_class("org/apache/logging/log4j/LogManager") {
-        let engine_name = _env.new_string("CrowEngine").unwrap();
-        if let Ok(logger_obj) = _env.call_static_method(
-            log_manager,
-            "getLogger",
-            "(Ljava/lang/String;)Lorg/apache/logging/log4j/Logger;",
-            &[JValue::Object(&engine_name)],
-        ).and_then(|v| v.l()) {
-            let j_msg = _env.new_string(message.to_string()).unwrap();
-            let _ = _env.call_method(
-                logger_obj,
-                "info",
-                "(Ljava/lang/String;)V",
-                &[JValue::Object(&j_msg)],
-            );
-        }
-    }
-}
-#[allow(improper_ctypes_definitions)]
-pub unsafe extern "C" fn clogger_err(_env: &mut JNIEnv<'_>, message: impl ToString) { //crow error logger
-    if let Ok(log_manager) = _env.find_class("org/apache/logging/log4j/LogManager") {
-        let engine_name = _env.new_string("CrowEngine").unwrap();
-        if let Ok(logger_obj) = _env.call_static_method(
-            log_manager,
-            "getLogger",
-            "(Ljava/lang/String;)Lorg/apache/logging/log4j/Logger;",
-            &[JValue::Object(&engine_name)],
-        ).and_then(|v| v.l()) {
-            let j_msg = _env.new_string(message.to_string()).unwrap();
-            let _ = _env.call_method(
-                logger_obj,
-                "error",
-                "(Ljava/lang/String;)V",
-                &[JValue::Object(&j_msg)],
-            );
-        }
-    }
-}
-#[allow(improper_ctypes_definitions)]
-pub unsafe extern "C" fn clogger_warn(_env: &mut JNIEnv<'_>, message: impl ToString) { //self explanatory
-    if let Ok(log_manager) = _env.find_class("org/apache/logging/log4j/LogManager") {
-        let engine_name = _env.new_string("CrowEngine").unwrap();
-        if let Ok(logger_obj) = _env.call_static_method(
-            log_manager,
-            "getLogger",
-            "(Ljava/lang/String;)Lorg/apache/logging/log4j/Logger;",
-            &[JValue::Object(&engine_name)],
-        ).and_then(|v| v.l()) {
-            let j_msg = _env.new_string(message.to_string()).unwrap();
-            let _ = _env.call_method(
-                logger_obj,
-                "warn",
-                "(Ljava/lang/String;)V",
-                &[JValue::Object(&j_msg)],
-            );
-        }
-    }
-}
-#[allow(unused)]
-#[allow(improper_ctypes_definitions)]
-pub fn crow_broadcast_tick(mut _env: JNIEnv<'_>, _class: jni::objects::JClass){ //I feel like api should manage this
-    let tps = match unsafe { get_minecraft_tps(&mut _env) } {
-        Ok(tps) => tps,
-        Err(_e) => 20.0,
-        _ => {unsafe { clogger_err(&mut _env, "[CROW ERROR] Something ain't right.(broadcast tick)".to_string()) }; 20.0},
+    let mgr_sig = unsafe {
+        FieldSignature::from_raw_parts(
+            jni_str!("Lnet/minecraft/world/TickRateManager;"),
+            jni::signature::JavaType::Object,
+        )
     };
-    let dt = 1.0/tps;
+    let manager = match env
+        .get_field(server, jni_str!("tickRateManager"), mgr_sig)
+        .and_then(|v| v.l())
+    {
+        Ok(m) if !m.is_null() => m,
+        _ => return Ok(20.0),
+    };
+
+    let sig = RuntimeMethodSignature::from_str("()F").unwrap();
+    let sig = sig.method_signature();
+    match env
+        .call_method(manager, jni_str!("tickrate"), sig, &[])
+        .and_then(|v| v.f())
+    {
+        Ok(tps) if tps > 0.0 => Ok(tps),
+        _ => Ok(20.0),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn crow_register_tick(tick: unsafe extern "C" fn(f32)) {
+    if let Ok(mut listeners) = TICK_LISTENERS.lock() {
+        listeners.push(tick);
+    }
+}
+
+pub fn crow_broadcast_tick(mut env: Env<'_>, _class: jni::objects::JClass) {
+    let tps = get_tps(&mut env).unwrap_or(20.0).max(0.001);
+    let dt = 1.0 / tps;
     if let Ok(listeners) = TICK_LISTENERS.lock() {
         for tick_func in listeners.iter() {
             unsafe {
@@ -245,116 +415,68 @@ pub fn crow_broadcast_tick(mut _env: JNIEnv<'_>, _class: jni::objects::JClass){ 
             }
         }
     }
-
-} //yes and no a reference
-pub async fn crow_manepear(_env: &mut JNIEnv<'_>)/*-> Vec<Library>*/ {
-    let active_mods = unsafe { scan_n_load_m("./mods") };
-    for lib in active_mods.iter() {
-        unsafe {
-            init_mod(lib);
-        }
-    }
-
-    unsafe { clogger(_env,format!("[CROW] {} mods are now active in memory.", active_mods.len())) };
-   // return active_mods;
 }
-pub fn wait_load<'a>(env: &'a mut JNIEnv<'a>)-> Result<(), ()>{
-    println!("[CROW] Waiting for Splash Screen to finish...");
 
-    let mc_class = unsafe { env.find_class("net/minecraft/client/Minecraft").unwrap_unchecked() };
-
-    // Get the static instance: Minecraft.getInstance()
-    let mc_inst = env.call_static_method(
-        mc_class,
-        "getInstance",
-        "()Lnet/minecraft/client/Minecraft;",
-        &[]
-    ).unwrap().l().unwrap();
-
-    loop {
-        // Field 'overlay' holds the Splash Screen (LoadingOverlay)
-        // If overlay == null, the loading screen is GONE.
-        let overlay = unsafe { env.get_field(
-            &mc_inst,
-            "overlay", // Obfuscated name might be 'bd' or similar in some builds
-            "Lnet/minecraft/client/gui/screens/Overlay;"
-        ).unwrap_unchecked().l().unwrap() };
-
-        if overlay.is_null() {
-            println!("[CROW] Splash Screen Finished! Window is ready.");
-            break;
-        }
-
-        // Don't toast the CPU while waiting
-        std::thread::sleep(std::time::Duration::from_millis(500));
+pub fn crow_manepear(env: &mut Env<'_>) -> Result<()> {
+    let mods_dir = PathBuf::from("./mods");
+    if !mods_dir.exists() {
+        fs::create_dir_all(&mods_dir).context("failed to create ./mods")?;
+        println!("[CROW] Created empty mods directory.");
+        return Ok(());
     }
+
+    let mut loaded = Vec::new();
+    load_natives(&mods_dir, &mut loaded);
+    load_wasms(&mods_dir, &mut loaded);
+
+    for item in &loaded {
+        if let WasNat::Native(lib) = item {
+            unsafe {
+                init_mod(lib, env);
+            }
+        }
+    }
+
+    let count = loaded.len();
+    if let Ok(mut mods) = LOADED_MODS.lock() {
+        mods.extend(loaded);
+    }
+    println!("[CROW] {count} mods are now active in memory.");
     Ok(())
 }
-pub fn wait_world<'a>(env: &'a mut JNIEnv<'a>)-> Result<(), ()>{
-    println!("[CROW] Waiting for World to Load...");
-    unsafe{clogger_warn(env, "Waiting for World to Load...");}
 
-    let mc_class = unsafe { env.find_class("net/minecraft/client/Minecraft").unwrap_unchecked() };
+#[unsafe(no_mangle)]
+pub extern "C" fn ccrow_version() -> *const c_char {
+    CROW_VERSION.as_ptr()
+}
 
-    // Get the static instance: Minecraft.getInstance()
-    let mc_inst = env.call_static_method(
-        mc_class,
-        "getInstance",
-        "()Lnet/minecraft/client/Minecraft;",
-        &[]
-    ).unwrap().l().unwrap();
-
-    loop {
-        // Field 'level' holds the current world (ClientLevel)
-        // If level != null, the world is loaded.
-        let level = env.get_field(
-            &mc_inst,
-            "player", //
-            "Lnet/minecraft/client/Minecraft;"
-        );
-
-        if !level.is_err() {
-            println!("[CROW] World Loaded! Player can now join.");
-            break;
-        }
-
-        // Don't toast the CPU while waiting
-        std::thread::sleep(std::time::Duration::from_millis(500));
+#[unsafe(no_mangle)]
+pub extern "C" fn crow_main() {
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
     }
-    unsafe{clogger_err(env, "Waiting for World to Load...");}
-    Ok(())
-
-}
-
-
-#[unsafe(no_mangle)]
-#[allow(improper_ctypes_definitions)]
-pub unsafe extern "C" fn ccrow_version()-> String{ // core crow version
-    std::env::var("CARGO_PKG_VERSION").unwrap_or("0.0.0".to_string()).to_string()
-}
-
-#[allow(unused)]
-#[unsafe(no_mangle)]
-pub extern "system" fn crow_main() {
-    let mut _env = unsafe { get_env().ok_or("JVM NOT ATTACHED") };
-    //let mut e  = Box::new(_env);
-    unsafe { clogger(&mut _env, "IT WORKEST".to_string()) };
-    init(&mut _env);}
-// In your main init function
-pub fn init(env: &mut JNIEnv) {
-    // Get the global VM handle
-    let jvm = env.get_java_vm().expect("Failed to get JavaVM");
-    crow_api::binding::jni_init(jni::Env, LoaderC).unwrap();
-
-    std::thread::spawn(move || {
-
-        let mut thread_env = jvm.attach_current_thread().expect("Failed to attach thread");
-        let mut _env = unsafe { get_env().ok_or("JVM NOT ATTACHED") };
-        let _ = wait_world(&mut _env);
-        println!("[CROW] Logic started after world load.");
-
-
-
-    println!("[CROW] DLL Attached. Background watcher is active.");
+    thread::spawn(|| {
+        if let Err(e) = crow_start() {
+            eprintln!("[CROW ERROR] {e:?}");
+        }
     });
+}
+
+fn crow_start() -> Result<()> {
+    let begin = Instant::now();
+    while JVM.get().is_none() {
+        if begin.elapsed() > Duration::from_secs(30) {
+            anyhow::bail!("JVM was never initialized (JNI_OnLoad never ran)");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    with_env(|env| {
+        clogger(env, "IT WORKEST");
+        crow_manepear(env)
+    })
+}
+
+pub fn init(_env: &mut Env<'_>) {
+    crow_main();
 }
