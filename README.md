@@ -41,7 +41,6 @@ or
 Crow Engine is licensed under the GNU GPL v3. We believe in keeping the "Native Wings" of Minecraft open and free. Any modifications to the core engine must be shared with the community, and original attribution is required.
 
 
- - [ ] CLI Works?
- - [X] SDK V1?
- - [ ] Java Injector?
- - [X] Lazy?
+ - [ ] CLI
+ - [ ] API
+ - [ ] Mixins
