@@ -9,7 +9,7 @@ use jni::{
 };
 use libloading::Library;
 use std::{
-    ffi::{c_char, c_void, CStr, CString},
+    ffi::{c_char, c_void, CStr},
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -232,7 +232,7 @@ fn cleanup_crow() {
 pub extern "system" fn DllMain(_: *mut c_void, reason: u32, _: *mut c_void) -> i32 {
     match reason {
         1 => {
-            // DLL_PROCESS_ATTACH — do not do heavy work here
+            // DLL_PROCESS_ATTACH
             crow_main();
             1
         }
@@ -244,19 +244,36 @@ pub extern "system" fn DllMain(_: *mut c_void, reason: u32, _: *mut c_void) -> i
         _ => 1,
     }
 }
-
+#[allow(unused)]
 #[unsafe(no_mangle)]
 pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut c_void) -> jint {
     let _ = JVM.set(vm);
     crow_main();
-    jni::sys::JNI_VERSION_1_8
+    jni::sys::JNI_VERSION_24
 }
-
+#[allow(unused)]
 #[unsafe(no_mangle)]
 pub extern "system" fn JNI_OnUnload(_vm: JavaVM, _reserved: *mut c_void) {
     cleanup_crow();
 }
-
+#[allow(unused)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Agent_OnLoad(
+    vm: *mut jni::sys::JavaVM,
+    _options: *const std::os::raw::c_char,
+    _reserved: *mut std::os::raw::c_void,
+) -> jni::sys::jint {
+    println!("Loading Mixins");
+    crow_mixer::Agent_OnLoad(vm, _options, _reserved)
+}
+#[allow(unused)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Agent_OnUnload(
+    _vm: *mut jni::sys::JavaVM,
+    _reserved: *mut std::ffi::c_void,
+) {
+    cleanup_crow();
+}
 /// `true` when the Minecraft client is running.
 pub fn crunning(env: &mut Env<'_>) -> bool {
     let Ok(client_class) = env.find_class(jni_str!("net/minecraft/client/Minecraft")) else {
@@ -301,7 +318,6 @@ fn log_java(env: &mut Env<'_>, level: LogLevel, message: impl ToString) {
     let get_logger =
         RuntimeMethodSignature::from_str("(Ljava/lang/String;)Lorg/apache/logging/log4j/Logger;")
             .unwrap();
-    let sig = get_logger.method_signature();
     let engine_name = match env.new_string("CrowEngine") {
         Ok(s) => s,
         Err(_) => return,
