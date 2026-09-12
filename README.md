@@ -1,7 +1,7 @@
 # 🐦‍⬛Crow Engine
 Crow Engine is a high-performance, with a native modding SDK and loader for Minecraft 26.1+. Unlike traditional loaders that run inside the Java Virtual Machine (JVM), Crow leverages Rust to provide direct hardware access, SIMD-accelerated physics, and low-level rendering hooks.
 > [!note]
->Will support 1.21.8 - 1.2.11 Yarn later
+>Will support 1.21.8 - 1.2.11 Yarn probablt never
 # 🚀 Why Crow?
 Traditional modding hits a "Java Ceiling" where the Garbage Collector (GC) and JVM overhead limit what’s possible. Crow breaks this ceiling by moving heavy-duty logic to the native layer.
 
@@ -43,4 +43,4 @@ Crow Engine is licensed under the GNU GPL v3. We believe in keeping the "Native 
 
  - [ ] CLI
  - [ ] API
- - [ ] Mixins
+ - [X] Mixins

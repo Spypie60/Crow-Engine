@@ -260,7 +260,7 @@ pub extern "system" fn JNI_OnUnload(_vm: JavaVM, _reserved: *mut c_void) {
 #[unsafe(no_mangle)]
 pub extern "system" fn Agent_OnLoad(
     vm: *mut jni::sys::JavaVM,
-    _options: *const std::os::raw::c_char,
+    _options: *mut std::os::raw::c_char,
     _reserved: *mut std::os::raw::c_void,
 ) -> jni::sys::jint {
     println!("Loading Mixins");
@@ -357,7 +357,6 @@ pub fn clogger_err(env: &mut Env<'_>, message: impl ToString) {
     log_java(env, LogLevel::Error, message);
 }
 
-/// Stores a brand name for mods to read. Replacing `getServerModName()` needs a Java mixin.
 pub fn mod_name(_env: &mut Env<'_>, name: impl ToString) {
     if let Ok(mut slot) = MOD_NAME.lock() {
         *slot = Some(name.to_string());
