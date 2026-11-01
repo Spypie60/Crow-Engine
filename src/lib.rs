@@ -233,7 +233,7 @@ pub extern "system" fn DllMain(_: *mut c_void, reason: u32, _: *mut c_void) -> i
     match reason {
         1 => {
             // DLL_PROCESS_ATTACH
-            crow_main();
+            println!("[Crow] Minecraft Loading...");
             1
         }
         0 => {
