@@ -10,8 +10,8 @@ pub use log::*;
 pub use mods::*;
 pub use state::*;
 
-use anyhow::{Context, Result};
-use jni::{sys::jint, Env, JavaVM};
+use anyhow::Result;
+use jni::{sys::jint, JavaVM};
 use std::{
     ffi::c_void,
     sync::atomic::Ordering,
@@ -19,11 +19,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{jvm::with_env, log::clogger_warn};
+//use crate::{jvm::with_env, log::clogger_warn};
 
 fn cleanup_crow() {
     println!("[CROW] Closing...");
-    
 }
 
 #[cfg(windows)]
