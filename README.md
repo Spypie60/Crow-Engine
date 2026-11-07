@@ -37,6 +37,15 @@ Build and inject into a running instance
 or
 ``crow build`` 
 ``crow run``
+# Downloading for Clients
+- Go to releases or build the app with ``cargo build --release``
+- Go to minecraft versions or find the version for other launchers
+- make sure for example in modrinth you go to profiles then select the version
+- Paste the dll you have downloaded or built into minecraft path
+- Copy path of dll with Ctrl+Shift+C
+- In args for all launchers paste the copied path like:
+- -agentpath:yourpath
+- Load game and check logs or if it doesn't crash
 # ⚖️ License
 Crow Engine is licensed under the GNU GPL v3. We believe in keeping the "Native Wings" of Minecraft open and free. Any modifications to the core engine must be shared with the community, and original attribution is required.
 
